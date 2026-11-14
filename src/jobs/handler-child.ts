@@ -18,18 +18,11 @@ async function startParentWatchdog(): Promise<void> {
   const parentPid = Number(process.env.FORGEQUEUE_PARENT_PID);
   const parentStartTime = process.env.FORGEQUEUE_PARENT_START_TIME;
 
-  if (
-    !Number.isSafeInteger(parentPid) ||
-    parentPid <= 0 ||
-    !parentStartTime
-  ) {
+  if (!Number.isSafeInteger(parentPid) || parentPid <= 0 || !parentStartTime) {
     throw new Error("Missing or invalid parent process identity");
   }
 
-  if (
-  process.platform !== "linux" &&
-  process.platform !== "android"
-) {
+  if (process.platform !== "linux" && process.platform !== "android") {
     throw new Error("Parent watchdog requires Linux");
   }
 
@@ -37,36 +30,40 @@ async function startParentWatchdog(): Promise<void> {
     const fs = require("node:fs");
     const { workerData } = require("node:worker_threads");
 
-    function getStartTime(pid) {
-      const stat = fs.readFileSync(
-        "/proc/" + pid + "/stat",
-        "utf8"
-      );
+    function getProcessIdentity(pid) {
+  const stat = fs.readFileSync(
+    "/proc/" + pid + "/stat",
+    "utf8"
+  );
 
-      const closingParen = stat.lastIndexOf(")");
+  const closingParen = stat.lastIndexOf(")");
 
-      if (closingParen === -1) {
-        throw new Error("Invalid process stat");
-      }
+  if (closingParen === -1) {
+    throw new Error("Invalid process stat");
+  }
 
-      const fields = stat.slice(closingParen + 2)
-        .trim()
-        .split(/\\s+/);
+  const fields = stat.slice(closingParen + 2)
+    .trim()
+    .split(/\\s+/);
 
-      return fields[19];
-    }
+  return {
+    state: fields[0],
+    startTime: fields[19],
+  };
+}
 
     const timer = setInterval(() => {
       try {
-        const currentStartTime = getStartTime(
-          workerData.parentPid
-        );
+        const parent = getProcessIdentity(workerData.parentPid);
 
-        if (currentStartTime !== workerData.parentStartTime) {
-          process.kill(process.pid, "SIGKILL");
-        }
+if (
+  parent.state === "Z" ||
+  parent.state === "X" ||
+  parent.startTime !== workerData.parentStartTime
+) {
+  process.kill(process.pid, "SIGKILL");
+}
       } catch (error) {
-        // Fail closed if the original parent cannot be verified.
         process.kill(process.pid, "SIGKILL");
       }
     }, 100);
@@ -104,9 +101,7 @@ async function startParentWatchdog(): Promise<void> {
 
     currentWatchdog.on("exit", (code) => {
       if (!stoppingWatchdog) {
-        console.error(
-          `[handler-child] Watchdog exited unexpectedly: ${code}`
-        );
+        console.error(`[handler-child] Watchdog exited unexpectedly: ${code}`);
 
         process.kill(process.pid, "SIGKILL");
       }
@@ -127,11 +122,10 @@ async function stopParentWatchdog(): Promise<void> {
 
 async function sendResult(
   message: { success: boolean; error?: string },
-  exitCode: number
+  exitCode: number,
 ): Promise<void> {
   try {
     await stopParentWatchdog();
-    console.error("[handler-child] Watchdog stopped");
   } catch (error) {
     console.error("[handler-child] Watchdog shutdown failed:", error);
     process.exitCode = 1;
@@ -146,10 +140,7 @@ async function sendResult(
 
   disconnecting = true;
 
-  console.error("[handler-child] Sending result:", message);
-
   process.send?.(message, (error) => {
-    console.error("[handler-child] IPC send callback:", error);
     if (error) {
       process.exitCode = 1;
     }
@@ -168,17 +159,16 @@ async function main(): Promise<void> {
   await startParentWatchdog();
 
   process.once("disconnect", () => {
-  if (disconnecting) return;
+    if (disconnecting) return;
 
-  controller.abort();
+    controller.abort();
 
-  void stopParentWatchdog().finally(() => {
-    process.exit(1);
+    void stopParentWatchdog().finally(() => {
+      process.exit(1);
+    });
   });
-});
 
-  const registrationModule =
-    process.env.FORGEQUEUE_HANDLER_REGISTRATION;
+  const registrationModule = process.env.FORGEQUEUE_HANDLER_REGISTRATION;
 
   if (registrationModule) {
     await import(pathToFileURL(registrationModule).href);
@@ -217,9 +207,7 @@ async function main(): Promise<void> {
       const handler = getHandler(request.type);
 
       if (!handler) {
-        throw new Error(
-          `No handler registered for: ${request.type}`
-        );
+        throw new Error(`No handler registered for: ${request.type}`);
       }
 
       await handler(request.payload, {
@@ -227,10 +215,7 @@ async function main(): Promise<void> {
       });
 
       if (controller.signal.aborted) {
-        await sendResult(
-          { success: false, error: "Handler aborted" },
-          1
-        );
+        await sendResult({ success: false, error: "Handler aborted" }, 1);
         return;
       }
 
@@ -239,12 +224,9 @@ async function main(): Promise<void> {
       await sendResult(
         {
           success: false,
-          error:
-            error instanceof Error
-              ? error.message
-              : String(error),
+          error: error instanceof Error ? error.message : String(error),
         },
-        1
+        1,
       );
     }
   });
