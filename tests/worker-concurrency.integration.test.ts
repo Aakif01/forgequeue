@@ -1,5 +1,4 @@
 import { readFile } from "node:fs/promises";
-
 import {
   afterAll,
   beforeAll,
@@ -16,6 +15,10 @@ import { claimJob } from "../src/jobs/job.repository.js";
 describe("Worker concurrency integration tests", () => {
   let clientId: string;
 
+  const jobCount = 100;
+  const workerCount = 20;
+  const testRunId = `concurrency-${Date.now()}`;
+
   beforeAll(async () => {
     const schema = await readFile(
       new URL("../src/database/schema.sql", import.meta.url),
@@ -24,19 +27,15 @@ describe("Worker concurrency integration tests", () => {
 
     await pool.query(schema);
 
-    const registered = await registerClient(
-      `concurrency-${Date.now()}`
-    );
-
+    const registered = await registerClient(testRunId);
     clientId = registered.client.id;
 
-    // Create 12 independent jobs for 12 concurrent claim attempts.
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < jobCount; i++) {
       await submitJob({
         clientId,
         type: "test.email",
         payload: { index: i },
-        idempotencyKey: `concurrency-${Date.now()}-${i}`,
+        idempotencyKey: `${testRunId}-${i}`,
       });
     }
   });
@@ -59,45 +58,66 @@ describe("Worker concurrency integration tests", () => {
     }
   });
 
-  it("allows concurrent workers to claim distinct jobs", async () => {
-    const claims = await Promise.all(
-      Array.from({ length: 12 }, (_, i) =>
-        claimJob(`concurrent-worker-${i}`, 30)
-      )
+  it("allows concurrent workers to claim 100 distinct jobs", async () => {
+    const successfulClaims = [];
+
+    for (let round = 0; round < jobCount / workerCount; round++) {
+      const claims = await Promise.all(
+        Array.from({ length: workerCount }, (_, workerIndex) =>
+          claimJob(
+            `concurrent-worker-${round}-${workerIndex}`,
+            30
+          )
+        )
+      );
+
+      successfulClaims.push(
+        ...claims.filter((job) => job !== null)
+      );
+    }
+
+    expect(successfulClaims).toHaveLength(jobCount);
+
+    const claimedIds = successfulClaims.map((job) => job.id);
+    const leaseTokens = successfulClaims.map(
+      (job) => job.lease_token
     );
 
-    const successfulClaims = claims.filter(
-      (job) => job !== null
-    );
-
-    const claimedIds = successfulClaims.map(
-      (job) => job.id
-    );
-
-    expect(successfulClaims).toHaveLength(12);
-    expect(new Set(claimedIds).size).toBe(12);
+    expect(new Set(claimedIds).size).toBe(jobCount);
+    expect(new Set(leaseTokens).size).toBe(jobCount);
 
     expect(
       successfulClaims.every(
-        (job) => job.status === "running"
+        (job) =>
+          job.status === "running" &&
+          job.locked_by !== null &&
+          job.lease_token !== null
       )
     ).toBe(true);
 
-    expect(
-      successfulClaims.every(
-        (job) => job.locked_by !== null &&
-                 job.lease_token !== null
-      )
-    ).toBe(true);
-
-    const remaining = await pool.query(
-      `SELECT COUNT(*)::int AS count
+    const result = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE status = 'pending')::int AS pending,
+         COUNT(*) FILTER (WHERE status = 'running')::int AS running,
+         COUNT(*)::int AS total
        FROM jobs
-       WHERE client_id = $1
-         AND status = 'pending'`,
+       WHERE client_id = $1`,
       [clientId]
     );
 
-    expect(remaining.rows[0].count).toBe(0);
+    expect(result.rows[0]).toEqual({
+      pending: 0,
+      running: jobCount,
+      total: jobCount,
+    });
+
+    const databaseJobs = await pool.query(
+      "SELECT id FROM jobs WHERE client_id = $1",
+      [clientId]
+    );
+
+    expect(new Set(databaseJobs.rows.map((job) => job.id))).toEqual(
+      new Set(claimedIds)
+    );
   });
 });
